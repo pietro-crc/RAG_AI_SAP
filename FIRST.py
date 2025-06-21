@@ -48,7 +48,7 @@ from functools import lru_cache
 
 # Configurazione della pagina - DEVE essere la prima chiamata Streamlit
 st.set_page_config(
-    page_title="Zobele Trento - Chat PDF",
+    page_title="KDC-Chat PDF",
     page_icon="🏢",
     layout="wide"
 )
@@ -132,7 +132,7 @@ Sei un assistente esperto che risponde a domande sui documenti.
 Usa le seguenti informazioni estratte dal documento per rispondere alla domanda dell'utente.
 
 ISTRUZIONI IMPORTANTI:
-1. Rispondi SEMPRE nella lingua della domanda, indipendentemente dalla lingua della domanda.
+1. Rispondi SEMPRE nella lingua della domanda.
 2. La tua risposta deve includere DUE PARTI:
    - Prima parte: informazioni direttamente presenti nel contesto fornito
    - Seconda parte: aggiungi conoscenze rilevanti che non sono esplicitamente menzionate nel contesto ma che arricchiscono la risposta
@@ -143,6 +143,8 @@ ISTRUZIONI IMPORTANTI:
 
 4. Se non trovi informazioni nel contesto, dillo chiaramente ma poi offri comunque conoscenze generali sull'argomento.
 5. Mantieni un tono professionale ma accessibile.
+6. IMPORTANTE: Quando nel contesto sono menzionate immagini tra parentesi quadre [Immagine: ...], considera che sono collegate al testo che le precede. 
+   Le descrizioni di immagini sono relative al contenuto del documento e forniscono informazioni visive correlate.
 
 Domanda: {question}
 Contesto: {context}
@@ -321,8 +323,8 @@ h1, h2, h3 {
 # Header Zobele
 st.markdown("""
 <div class="main-header">
-    <h1>🏢 ZOBELE TRENTO</h1>
-    <h3>Sistema di Analisi Documenti PDF</h3>
+    <h1>🏢 Sistema di Analisi Documenti PDF</h1>
+    <h3>RAG_AI_SAP_ZOB</h3>
 </div>
 """, unsafe_allow_html=True)
 # FINE BLOCCO CSS
@@ -529,28 +531,85 @@ def extract_text_internal(file_path):
     except Exception as e:
         return f"Errore nell'elaborazione immagine {file_path}: {str(e)}"
 
-def extract_text(file_path):
-    """Wrapper pubblico per l'estrazione del testo"""
-    return extract_text_internal(file_path)
+def extract_text(file_path, context=""):
+    """Wrapper pubblico per l'estrazione del testo con contesto"""
+    # Se c'è contesto, includilo nel prompt
+    if context:
+        prompt = f"Questa immagine appare nel seguente contesto:\n{context}\n\nDescrivi cosa vedi nell'immagine, considerando il contesto fornito."
+    else:
+        prompt = "Descrivi brevemente cosa vedi in questa immagine, concentrandoti sul testo e sugli elementi chiave."
+    
+    try:
+        model_with_image_context = model.bind(images=[file_path])
+        return model_with_image_context.invoke(prompt)
+    except Exception as e:
+        return f"Errore nell'elaborazione immagine {file_path}: {str(e)}"
 
-def process_images_parallel(image_files, figures_dir, max_workers=3):
-    """Elabora le immagini in parallelo per velocizzare il processo"""
+def process_images_parallel(image_files, figures_dir, context_map=None, max_workers=3, timeout_per_image=300):
+    """
+    Elabora le immagini in parallelo con controlli avanzati e contesto
+    
+    Args:
+        image_files: Lista di file immagine
+        figures_dir: Directory delle figure
+        context_map: Dizionario che mappa nomi file a contesti
+        max_workers: Numero massimo di worker paralleli
+        timeout_per_image: Timeout in secondi per ogni immagine
+    """
     
     st.info(f"🚀 Elaborazione parallela di {len(image_files)} immagini con {max_workers} worker...")
+    
+    # Stato di elaborazione per tracciare le immagini (limitato alle prime 20 immagini per evitare loop)
+    display_limit = min(20, len(image_files))
+    processing_status = {}
+    for i, filename in enumerate(image_files[:display_limit]):
+        processing_status[filename] = {"status": "pending", "start_time": None, "duration": None}
+    
+    if len(image_files) > display_limit:
+        st.info(f"⚠️ Mostro lo stato solo per le prime {display_limit} immagini (su {len(image_files)} totali)")
+    
+    # Contenitore per i risultati
+    results = []
     
     def process_single_image(file_info):
         index, filename = file_info
         file_path = os.path.join(figures_dir, filename)
+        
+        # Ottieni il contesto per questa immagine, se disponibile
+        context = context_map.get(filename, "") if context_map else ""
+        
         start_time = time.time()
         
+        # Aggiorna stato solo se è tra quelli visualizzati
+        if filename in processing_status:
+            processing_status[filename]["status"] = "processing"
+            processing_status[filename]["start_time"] = start_time
+        
         try:
-            # Verifica dimensione file per evitare immagini troppo grandi
+            # Verifica dimensione file
             file_size = os.path.getsize(file_path)
             if file_size > 10 * 1024 * 1024:  # 10MB limite
-                return f"Immagine {filename} troppo grande ({file_size/1024/1024:.1f}MB), saltata"
+                if filename in processing_status:
+                    processing_status[filename]["status"] = "skipped"
+                return {
+                    'index': index,
+                    'filename': filename,
+                    'text': f"Immagine {filename} troppo grande ({file_size/1024/1024:.1f}MB), saltata",
+                    'time': 0,
+                    'success': False
+                }
             
-            extracted_text = extract_text(file_path)
+            extracted_text = extract_text(file_path, context)
             process_time = time.time() - start_time
+            
+            # Aggiorna stato
+            if filename in processing_status:
+                processing_status[filename]["status"] = "completed"
+                processing_status[filename]["duration"] = process_time
+            
+            # Se c'è contesto, aggiungi un prefisso esplicito
+            if context:
+                extracted_text = f"[Nel contesto: {context.strip()[:100]}...]\n{extracted_text}"
             
             return {
                 'index': index,
@@ -560,43 +619,135 @@ def process_images_parallel(image_files, figures_dir, max_workers=3):
                 'success': True
             }
         except Exception as e:
+            # Aggiorna stato
+            if filename in processing_status:
+                processing_status[filename]["status"] = "failed"
+                processing_status[filename]["duration"] = time.time() - start_time
+            
             return {
                 'index': index,
                 'filename': filename,
                 'text': f"Errore: {str(e)}",
-                'time': 0,
+                'time': time.time() - start_time,
                 'success': False
             }
     
-    # Usa ThreadPoolExecutor per elaborazione parallela
+    # Prepara contenitori per il monitoraggio
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Crea una singola area di monitoraggio fissa (non verrà ricreata a ogni ciclo)
+    monitoring_expander = st.expander("Monitoraggio elaborazione immagini")
+    
+    # Crea contenitori fissi per il monitoraggio all'interno dell'expander
+    with monitoring_expander:
+        monitoring_table = st.empty()
+    
+    # Crea executor con timeout
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Prepara i task
         image_tasks = [(i, filename) for i, filename in enumerate(image_files)]
         
-        # Crea progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Sottometti tutti i task
+        # Memorizza i future per poterli cancellare se necessario
         future_to_image = {executor.submit(process_single_image, task): task for task in image_tasks}
         
-        results = []
         completed = 0
+        total_images = len(image_files)
+        stuck_warning_shown = {}  # Dizionario per tracciare i warning per file
         
-        # Raccogli i risultati man mano che completano
-        for future in concurrent.futures.as_completed(future_to_image):
-            result = future.result()
-            results.append(result)
-            completed += 1
+        # Loop principale con monitoraggio
+        while future_to_image and completed < total_images:
+            # Controlla quali future sono completati
+            just_completed = []
+            for future in list(future_to_image.keys()):
+                if future.done():
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        completed += 1
+                        
+                        # Aggiorna progress bar
+                        progress = completed / total_images
+                        progress_bar.progress(progress)
+                        
+                        if result['success']:
+                            status_text.success(f"✅ {completed}/{total_images}: {result['filename']} elaborata in {result['time']:.2f}s")
+                        else:
+                            status_text.error(f"❌ {completed}/{total_images}: Errore in {result['filename']}")
+                    except Exception as e:
+                        completed += 1
+                        status_text.error(f"❌ Errore imprevisto: {str(e)}")
+                    
+                    # Rimuovi dalla lista dei future attivi
+                    just_completed.append(future)
             
-            # Aggiorna progress bar
-            progress = completed / len(image_files)
-            progress_bar.progress(progress)
+            # Rimuovi i future completati
+            for future in just_completed:
+                del future_to_image[future]
             
-            if result['success']:
-                status_text.success(f"✅ {result['filename']} elaborata in {result['time']:.2f}s")
-            else:
-                status_text.error(f"❌ Errore in {result['filename']}")
+            # Aggiorna la tabella di monitoraggio - solo una volta per ciclo
+            status_data = []
+            for filename, status in processing_status.items():
+                if status["status"] == "processing":
+                    current_duration = time.time() - status["start_time"] if status["start_time"] else 0
+                    
+                    # Avvisa su immagini bloccate
+                    if current_duration > timeout_per_image and filename not in stuck_warning_shown:
+                        with monitoring_expander:
+                            st.warning(f"⚠️ L'elaborazione di {filename} sta impiegando molto tempo ({current_duration:.0f}s)")
+                            force_key = f"force_{filename.replace('.','_')}"
+                            if st.button("Forza completamento", key=force_key):
+                                # Trova il future corrispondente e cancellalo
+                                for f, (_, fname) in future_to_image.items():
+                                    if fname == filename:
+                                        f.cancel()
+                                        break
+                        stuck_warning_shown[filename] = True
+                else:
+                    current_duration = status["duration"] if status["duration"] else 0
+                
+                status_data.append({
+                    "File": filename,
+                    "Stato": status["status"],
+                    "Tempo (s)": f"{current_duration:.1f}"
+                })
+            
+            # Aggiorna la tabella di monitoraggio con i dati raccolti
+            monitoring_table.table(status_data)
+            
+            # Controlla timeout
+            for future, (index, filename) in list(future_to_image.items()):
+                if filename in processing_status and processing_status[filename]["status"] == "processing" and processing_status[filename]["start_time"]:
+                    duration = time.time() - processing_status[filename]["start_time"]
+                    if duration > timeout_per_image:
+                        status_text.warning(f"⚠️ Timeout per {filename} dopo {duration:.1f} secondi. Cancellazione...")
+                        
+                        # Cancella il future
+                        future.cancel()
+                        
+                        # Aggiungi errore ai risultati
+                        results.append({
+                            'index': index,
+                            'filename': filename,
+                            'text': f"Timeout dopo {duration:.1f} secondi",
+                            'time': duration,
+                            'success': False
+                        })
+                        
+                        # Aggiorna stato e rimuovi dai future attivi
+                        if filename in processing_status:
+                            processing_status[filename]["status"] = "timeout"
+                            processing_status[filename]["duration"] = duration
+                        del future_to_image[future]
+                        
+                        completed += 1
+                        progress_bar.progress(completed / total_images)
+            
+            # Pausa per non sovraccaricare l'interfaccia
+            time.sleep(0.5)
+        
+        # Risultati finali
+        status_text.success(f"✅ Completato: {completed}/{total_images} immagini elaborate")
         
         # Ordina i risultati per index originale
         results.sort(key=lambda x: x['index'])
@@ -702,7 +853,39 @@ def load_pdf(file_path):
         with st.expander("👀 Anteprima testo estratto (primi 500 caratteri)"):
             st.text(final_text[:500] + "..." if len(final_text) > 500 else final_text)
         
-        return final_text
+        # Organizza gli elementi mantenendo l'ordine e le relazioni
+        organized_elements = []
+        context_window = []
+        
+        for element in elements:
+            # Se è un'immagine, mantieni il contesto precedente
+            if element.category in ["Image", "Table"]:
+                # Prendi fino a 3 elementi di testo precedenti come contesto
+                previous_context = "\n".join([e.text for e in context_window[-3:] if hasattr(e, 'text')])
+                
+                # Crea un elemento contestualizzato
+                contextualized_element = {
+                    "type": element.category,
+                    "content": element.text if hasattr(element, 'text') else "",
+                    "filename": element.metadata.filename if hasattr(element, 'metadata') and hasattr(element.metadata, 'filename') else None,
+                    "context": previous_context,
+                    "original_index": len(organized_elements)
+                }
+                organized_elements.append(contextualized_element)
+            else:
+                # Elementi di testo normali
+                organized_elements.append({
+                    "type": element.category,
+                    "content": element.text,
+                    "context": "",
+                    "original_index": len(organized_elements)
+                })
+                # Aggiorna la finestra di contesto
+                context_window.append(element)
+                if len(context_window) > 5:  # Mantieni gli ultimi 5 elementi
+                    context_window.pop(0)
+    
+        return organized_elements
         
     except Exception as e:
         # Cattura e mostra eventuali errori in modo più leggibile
@@ -714,32 +897,58 @@ def load_pdf(file_path):
             st.error(f"Errore durante l'elaborazione del PDF: {error_message}")
         return f"Errore durante l'elaborazione del PDF: {error_message}"
 
-def split_text(text):
+def split_text(text, element_data=None):
     st.info("✂️ Inizio suddivisione del testo in chunks...")
-    start_time = time.time()
     
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        add_start_index=True
-    )
-
-    chunks = text_splitter.split_text(text)
-    split_time = time.time() - start_time
-    
-    st.success(f"✅ Testo suddiviso in {len(chunks)} chunks in {split_time:.2f} secondi")
-    
-    # Mostra statistiche sui chunks
-    chunk_lengths = [len(chunk) for chunk in chunks]
-    avg_length = sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else 0
-    
-    st.info(f"📊 Statistiche chunks:")
-    st.text(f"  - Numero totale: {len(chunks)}")
-    st.text(f"  - Lunghezza media: {avg_length:.0f} caratteri")
-    st.text(f"  - Lunghezza min: {min(chunk_lengths) if chunk_lengths else 0}")
-    st.text(f"  - Lunghezza max: {max(chunk_lengths) if chunk_lengths else 0}")
-    
-    return chunks
+    # Se abbiamo dati sugli elementi, usa una strategia più intelligente
+    if element_data:
+        chunks = []
+        current_chunk = ""
+        current_context = ""
+        
+        for element in element_data:
+            if element["type"] in ["Image", "Table"]:
+                # Se il chunk corrente è troppo grande, dividilo
+                if len(current_chunk) > 800:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+                
+                # Aggiorna il contesto corrente
+                current_context = element.get("context", "")
+                
+                # Aggiungi prefisso per chiarire la relazione
+                image_text = f"[Immagine correlata al testo precedente: {element['content']}]"
+                
+                # Aggiungi al chunk corrente o crea un nuovo chunk
+                if current_chunk:
+                    current_chunk += "\n\n" + image_text
+                else:
+                    current_chunk = current_context + "\n\n" + image_text
+            else:
+                # Testo normale
+                current_chunk += "\n" + element["content"]
+                
+                # Se il chunk diventa troppo grande, dividilo
+                if len(current_chunk) > 1000:
+                    chunks.append(current_chunk)
+                    # Mantieni un po' di overlap
+                    current_chunk = current_chunk[-200:]
+        
+        # Aggiungi l'ultimo chunk se non è vuoto
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        return chunks
+    else:
+        # Usa il metodo standard se non abbiamo i dati degli elementi
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            add_start_index=True
+        )
+        
+        chunks = text_splitter.split_text(text)
+        return chunks
 
 def index_docs(texts):
     if vector_store is None:
@@ -972,3 +1181,29 @@ if uploaded_file:
             st.rerun()
     else:
         st.warning("⚠️ Carica e elabora un PDF prima di fare domande.")
+
+def get_similar_docs(query, k=3):
+    if vector_store is None:
+        return []
+    
+    # Recupera i chunks più simili
+    documents = vector_store.similarity_search(query, k=k)
+    
+    # Se tra i risultati c'è un'immagine, cerca di recuperare anche i chunks adiacenti
+    image_indices = []
+    for i, doc in enumerate(documents):
+        if "[Immagine" in doc.page_content:
+            image_indices.append(i)
+    
+    # Se ci sono immagini, recupera chunks aggiuntivi per contesto
+    if image_indices and len(documents) < 5:
+        # Recupera alcuni documenti aggiuntivi
+        additional_docs = vector_store.similarity_search(query, k=3)
+        # Aggiungi solo quelli non già presenti
+        for doc in additional_docs:
+            if doc not in documents:
+                documents.append(doc)
+                if len(documents) >= 5:
+                    break
+    
+    return documents
